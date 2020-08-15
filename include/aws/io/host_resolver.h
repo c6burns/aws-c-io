@@ -72,6 +72,9 @@ struct aws_host_resolution_config {
     void *impl_data;
 };
 
+struct aws_host_resolver_listener_options;
+struct aws_host_resolver_get_cached_addresses_options;
+
 /** should you absolutely disdain the default implementation, feel free to implement your own. */
 struct aws_host_resolver_vtable {
     /** clean up everything you allocated, but not resolver itself. */
@@ -95,6 +98,15 @@ struct aws_host_resolver_vtable {
         struct aws_host_resolver *resolver,
         const struct aws_string *host_name,
         uint32_t flags);
+
+    /** add a listener to the host resolver. */
+    struct aws_host_resolver_listener *(
+        *add_listener)(struct aws_host_resolver *resolver, const struct aws_host_resolver_listener_options *options);
+
+    /* get any immediately available host addresses from the resolver. */
+    int (*get_cached_addresses)(
+        struct aws_host_resolver *resolver,
+        const struct aws_host_resolver_get_cached_addresses_options *options);
 };
 
 struct aws_host_resolver {
@@ -210,6 +222,84 @@ AWS_IO_API size_t aws_host_resolver_get_host_address_count(
     struct aws_host_resolver *resolver,
     const struct aws_string *host_name,
     uint32_t flags);
+
+struct aws_host_resolver_listener;
+
+struct aws_host_resolver_listener_vtable {
+    void (*acquire)(struct aws_host_resolver_listener *listener);
+    void (*release)(struct aws_host_resolver_listener *listener);
+};
+
+struct aws_host_resolver_listener {
+    struct aws_host_resolver_listener_vtable *vtable;
+    void *impl;
+};
+
+/* Callback for receiving a new host addresses from a listener. Memory for host_address is only guaranteed to exist
+ * during the callback, and must be copied if the caller needs it to persist after. */
+typedef void(aws_host_resolver_resolved_address_fn)(
+    struct aws_host_resolver_listener *listener,
+    struct aws_host_address *host_address,
+    void *user_data);
+
+typedef void(aws_host_resolver_listener_shutdown_fn)(void *user_data);
+
+struct aws_host_resolver_listener_options {
+
+    /* Name of the host to listen for notifications from. */
+    const struct aws_string *host_name;
+
+    /* Callback for when an address is resolved for the specified host. */
+    aws_host_resolver_resolved_address_fn *resolved_address_callback;
+
+    /* Callback for when a listener has completely shutdown. */
+    aws_host_resolver_listener_shutdown_fn *shutdown_callback;
+
+    /* User data to be passed into each callback. */
+    void *user_data;
+};
+
+/* Create and add a listener to the host resolver using the specified options. */
+AWS_IO_API struct aws_host_resolver_listener *aws_host_resolver_add_listener(
+    struct aws_host_resolver *resolver,
+    const struct aws_host_resolver_listener_options *options);
+
+/* Acquire a new reference to the listener. */
+AWS_IO_API void aws_host_resolver_listener_acquire(struct aws_host_resolver_listener *listener);
+
+/* Releases a reference to the listener. Once all references are released, the listener is removed from the host
+ * resolver. */
+AWS_IO_API void aws_host_resolver_listener_release(struct aws_host_resolver_listener *listener);
+
+/* Callback for receiving existing host addresses via aws_host_resolver_get_cached_addresses. Memory for host_address is
+ * only guaranteed to exist during the callback, and must be copied if the caller needs it to persist after. */
+typedef void(
+    aws_host_resolver_get_cached_addresses_callback_fn)(struct aws_host_address *host_address, void *user_data);
+
+/* Options structure for getting existing addresses of a host. */
+struct aws_host_resolver_get_cached_addresses_options {
+    struct aws_string *host_name;
+
+    /* Number of a-addresses to immediately retrieve from the cache. If the cache has less, it'll retrieve as
+     * many as possible. If set to g_aws_host_resolver_all_addresses, all available a-addresses will be returned.*/
+    size_t desired_num_a_addresses;
+
+    /* Number of aaaa-addresses to immediately retrieve from the cache. If the cache has less, it'll retrieve as
+     * many as possible. If set to g_aws_host_resolver_all_addresses, all available a-addresses will be returned.*/
+    size_t desired_num_aaaa_addresses;
+
+    aws_host_resolver_get_cached_addresses_callback_fn *get_cached_addresses_callback;
+    void *user_data;
+};
+
+/* Use this for a desired-number-of-addresses in aws_host_resolver_get_cached_addresses_options to get all of the
+ * addresses of that type. */
+extern const size_t g_aws_host_resolver_all_addresses;
+
+/* Synchronously read back existing addresses from the host table. */
+AWS_IO_API int aws_host_resolver_get_cached_addresses(
+    struct aws_host_resolver *resolver,
+    const struct aws_host_resolver_get_cached_addresses_options *options);
 
 AWS_EXTERN_C_END
 

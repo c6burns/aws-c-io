@@ -9,6 +9,7 @@
 
 #include <aws/io/event_loop.h>
 #include <aws/io/host_resolver.h>
+#include <aws/io/logging.h>
 
 #include <aws/testing/aws_test_harness.h>
 
@@ -964,3 +965,602 @@ static int s_test_resolver_ipv6_address_lookup_fn(struct aws_allocator *allocato
     return 0;
 }
 AWS_TEST_CASE(test_resolver_ipv6_address_lookup, s_test_resolver_ipv6_address_lookup_fn)
+
+struct listener_test_callback_data {
+    struct aws_allocator *allocator;
+    struct aws_condition_variable condition_variable;
+    bool invoked;
+    uint32_t error_code;
+    uint32_t expected_num_addresses;
+    struct aws_array_list address_list;
+    struct aws_mutex *mutex;
+};
+
+static bool s_listener_invoked_predicate(void *data) {
+    struct listener_test_callback_data *callback_data = data;
+    return callback_data->invoked;
+}
+
+static void s_listener_test_callback_data_init(
+    struct aws_allocator *allocator,
+    struct aws_mutex *mutex,
+    uint32_t expected_num_addresses,
+    struct listener_test_callback_data *callback_data) {
+
+    AWS_ZERO_STRUCT(*callback_data);
+
+    callback_data->allocator = allocator;
+    aws_condition_variable_init(&callback_data->condition_variable);
+    callback_data->mutex = mutex;
+    callback_data->expected_num_addresses = expected_num_addresses;
+
+    aws_array_list_init_dynamic(&callback_data->address_list, allocator, 4, sizeof(struct aws_host_address *));
+}
+
+static void s_clear_host_address_array_list(
+    struct aws_allocator *allocator,
+    struct aws_array_list *host_address_array_list) {
+
+    for (size_t i = 0; i < aws_array_list_length(host_address_array_list); ++i) {
+        struct aws_host_address *host_address = NULL;
+        aws_array_list_get_at(host_address_array_list, &host_address, i);
+        aws_host_address_clean_up(host_address);
+        aws_mem_release(allocator, host_address);
+    }
+
+    aws_array_list_clear(host_address_array_list);
+}
+
+static void s_listener_test_callback_data_clean_up(struct listener_test_callback_data *callback_data) {
+    s_clear_host_address_array_list(callback_data->allocator, &callback_data->address_list);
+    aws_array_list_clean_up(&callback_data->address_list);
+}
+
+static void s_listener_resolved_address_callback(
+    struct aws_host_resolver_listener *listener,
+    struct aws_host_address *host_address,
+    void *user_data) {
+    (void)listener;
+    (void)host_address;
+
+    struct listener_test_callback_data *callback_data = user_data;
+
+    bool expected_num_addresses_received = false;
+
+    aws_mutex_lock(callback_data->mutex);
+    callback_data->invoked = true;
+
+    struct aws_host_address *host_address_copy =
+        aws_mem_acquire(callback_data->allocator, sizeof(struct aws_host_address));
+    aws_host_address_copy(host_address, host_address_copy);
+
+    aws_array_list_push_back(&callback_data->address_list, &host_address_copy);
+
+    expected_num_addresses_received =
+        aws_array_list_length(&callback_data->address_list) == callback_data->expected_num_addresses;
+
+    AWS_LOGF_INFO(
+        AWS_LS_IO_DNS,
+        "Listener received callback for %d of %d addresses.",
+        (uint32_t)aws_array_list_length(&callback_data->address_list),
+        (uint32_t)callback_data->expected_num_addresses);
+
+    aws_mutex_unlock(callback_data->mutex);
+
+    if (expected_num_addresses_received) {
+        aws_condition_variable_notify_one(&callback_data->condition_variable);
+    }
+}
+
+/* For test cases where we don't care at all about the result of the initial non-listener resolver callback. */
+void s_listener_test_initial_resolved_callback_empty(
+    struct aws_host_resolver *resolver,
+    const struct aws_string *host_name,
+    int err_code,
+    const struct aws_array_list *host_addresses,
+    void *user_data) {
+    (void)resolver;
+    (void)host_name;
+    (void)err_code;
+    (void)host_addresses;
+    (void)user_data;
+}
+
+/* Setup a mock host resolver with the specified test host name and number of addresses. */
+static int s_setup_mock_host(
+    struct aws_allocator *allocator,
+    struct aws_host_resolver *resolver,
+    struct mock_dns_resolver *mock_resolver,
+    struct aws_string *host_name,
+    uint32_t num_ipv4,
+    uint32_t num_ipv6) {
+
+    (void)resolver;
+
+    struct aws_array_list address_list;
+
+    ASSERT_SUCCESS(
+        aws_array_list_init_dynamic(&address_list, allocator, num_ipv4 + num_ipv6, sizeof(struct aws_host_address)));
+
+    for (uint32_t i = 0; i < num_ipv4; ++i) {
+
+        char address_buffer[128] = "";
+        snprintf(address_buffer, sizeof(address_buffer), "test_address_%d_ipv4", i);
+
+        struct aws_host_address host_address_ipv4 = {
+            .address = aws_string_new_from_c_str(allocator, address_buffer),
+            .allocator = allocator,
+            .expiry = 0,
+            .host = aws_string_new_from_string(allocator, host_name),
+            .connection_failure_count = 0,
+            .record_type = AWS_ADDRESS_RECORD_TYPE_A,
+            .use_count = 0,
+            .weight = 0,
+        };
+
+        ASSERT_SUCCESS(aws_array_list_push_back(&address_list, &host_address_ipv4));
+    }
+
+    for (uint32_t i = 0; i < num_ipv6; ++i) {
+        char address_buffer[128] = "";
+        snprintf(address_buffer, sizeof(address_buffer), "test_address_%d_ipv6", i);
+
+        struct aws_host_address host_address_ipv6 = {
+            .address = aws_string_new_from_c_str(allocator, address_buffer),
+            .allocator = allocator,
+            .expiry = 0,
+            .host = aws_string_new_from_string(allocator, host_name),
+            .connection_failure_count = 0,
+            .record_type = AWS_ADDRESS_RECORD_TYPE_AAAA,
+            .use_count = 0,
+            .weight = 0,
+        };
+
+        ASSERT_SUCCESS(aws_array_list_push_back(&address_list, &host_address_ipv6));
+    }
+
+    ASSERT_SUCCESS(mock_dns_resolver_init(mock_resolver, 1, allocator));
+    ASSERT_SUCCESS(mock_dns_resolver_append_address_list(mock_resolver, &address_list));
+
+    return AWS_OP_SUCCESS;
+}
+
+/* Verify that a list of addresses has the expected number of ipv4 and ipv6 addresses, and has no duplicates. */
+static int s_verify_mock_address_list(
+    struct aws_array_list *address_list,
+    uint32_t expected_num_ipv4,
+    uint32_t expected_num_ipv6) {
+
+    /* We shouldn't have any more addresses than the sum of our expected amount. */
+    ASSERT_TRUE(aws_array_list_length(address_list) == (expected_num_ipv4 + expected_num_ipv6));
+
+    uint32_t num_ipv4 = 0;
+    uint32_t num_ipv6 = 0;
+
+    /* Make sure we have the expected number of ipv4 and ipv6 addresses. */
+    for (size_t i = 0; i < aws_array_list_length(address_list); ++i) {
+        struct aws_host_address *host_address = NULL;
+        ASSERT_SUCCESS(aws_array_list_get_at(address_list, &host_address, i));
+
+        if (host_address->record_type == AWS_ADDRESS_RECORD_TYPE_A) {
+            ++num_ipv4;
+        } else if (host_address->record_type == AWS_ADDRESS_RECORD_TYPE_AAAA) {
+            ++num_ipv6;
+        } else {
+            AWS_FATAL_ASSERT(false);
+        }
+    }
+
+    ASSERT_TRUE(num_ipv4 == expected_num_ipv4);
+    ASSERT_TRUE(num_ipv6 == expected_num_ipv6);
+
+    /* Make sure we don't have any duplicates. This is n^2, but list size is expected to be small, and this is only used
+     * for testing. */
+    for (size_t i = 0; i < aws_array_list_length(address_list); ++i) {
+        struct aws_host_address *host_address0 = NULL;
+        ASSERT_SUCCESS(aws_array_list_get_at(address_list, &host_address0, i));
+        struct aws_byte_cursor address_byte_cursor0 = aws_byte_cursor_from_string(host_address0->address);
+
+        for (size_t j = 0; j < aws_array_list_length(address_list); ++j) {
+            if (i == j) {
+                continue;
+            }
+
+            struct aws_host_address *host_address1 = NULL;
+            ASSERT_SUCCESS(aws_array_list_get_at(address_list, &host_address1, j));
+            struct aws_byte_cursor address_byte_cursor1 = aws_byte_cursor_from_string(host_address1->address);
+
+            ASSERT_FALSE(aws_byte_cursor_eq(&address_byte_cursor0, &address_byte_cursor1));
+        }
+    }
+
+    return AWS_OP_SUCCESS;
+}
+
+static void s_listener_shutdown_callback(void *user_data) {
+    struct listener_test_callback_data *callback_data = user_data;
+
+    aws_mutex_lock(callback_data->mutex);
+    callback_data->invoked = true;
+    aws_mutex_unlock(callback_data->mutex);
+
+    aws_condition_variable_notify_one(&callback_data->condition_variable);
+}
+
+static int s_test_resolver_listener_create_destroy_fn(struct aws_allocator *allocator, void *ctx) {
+    (void)ctx;
+
+    aws_io_library_init(allocator);
+
+    struct aws_string *host_name = aws_string_new_from_c_str(allocator, "test_host");
+    struct aws_event_loop_group *el_group = aws_event_loop_group_new_default(allocator, 1, NULL);
+    struct aws_host_resolver *resolver = aws_host_resolver_new_default(allocator, 10, el_group, NULL);
+    struct aws_host_resolver_listener *listener = NULL;
+
+    struct aws_mutex mutex = AWS_MUTEX_INIT;
+    struct listener_test_callback_data callback_data;
+    s_listener_test_callback_data_init(allocator, &mutex, 0, &callback_data);
+
+    /* Setup listener and then release the listener */
+    {
+        struct aws_host_resolver_listener_options listener_options = {
+            .host_name = host_name, .shutdown_callback = s_listener_shutdown_callback, .user_data = &callback_data};
+
+        listener = aws_host_resolver_add_listener(resolver, &listener_options);
+
+        aws_host_resolver_listener_release(listener);
+    }
+
+    /* Wait for listener to shutdown */
+    {
+        ASSERT_SUCCESS(aws_mutex_lock(&mutex));
+
+        aws_condition_variable_wait_pred(
+            &callback_data.condition_variable, &mutex, s_listener_invoked_predicate, &callback_data);
+
+        aws_mutex_unlock(&mutex);
+    }
+
+    aws_host_resolver_release(resolver);
+
+    s_listener_test_callback_data_clean_up(&callback_data);
+    aws_string_destroy(host_name);
+
+    aws_event_loop_group_release(el_group);
+    ASSERT_SUCCESS(aws_global_thread_creator_shutdown_wait_for(10));
+
+    aws_io_library_clean_up();
+
+    return 0;
+}
+
+AWS_TEST_CASE(test_resolver_listener_create_destroy, s_test_resolver_listener_create_destroy_fn)
+
+static int s_test_resolver_add_listener_before_host_fn(struct aws_allocator *allocator, void *ctx) {
+    (void)ctx;
+
+    aws_io_library_init(allocator);
+
+    struct aws_string *host_name = aws_string_new_from_c_str(allocator, "s3.us-east-1.amazonaws.com");
+    struct aws_event_loop_group *el_group = aws_event_loop_group_new_default(allocator, 1, NULL);
+    struct aws_host_resolver *resolver = aws_host_resolver_new_default(allocator, 10, el_group, NULL);
+    struct aws_host_resolver_listener *listener = NULL;
+
+    struct aws_mutex mutex = AWS_MUTEX_INIT;
+    struct listener_test_callback_data callback_data;
+
+    s_listener_test_callback_data_init(allocator, &mutex, 1, &callback_data);
+
+    /* Setup listener before host is added */
+    {
+        struct aws_host_resolver_listener_options listener_options = {.host_name = host_name,
+                                                                      .resolved_address_callback =
+                                                                          s_listener_resolved_address_callback,
+                                                                      .user_data = &callback_data};
+
+        listener = aws_host_resolver_add_listener(resolver, &listener_options);
+    }
+
+    /* Trigger resolve host */
+    {
+        struct aws_host_resolution_config config = {
+            .max_ttl = 1,
+            .impl = aws_default_dns_resolve,
+            .impl_data = NULL,
+        };
+
+        ASSERT_SUCCESS(aws_host_resolver_resolve_host(
+            resolver, host_name, s_listener_test_initial_resolved_callback_empty, &config, NULL));
+    }
+
+    /* Wait for listener to receive host resolved callback. */
+    {
+        ASSERT_SUCCESS(aws_mutex_lock(&mutex));
+
+        aws_condition_variable_wait_pred(
+            &callback_data.condition_variable, &mutex, s_listener_invoked_predicate, &callback_data);
+
+        /* Reset flag for re-use */
+        callback_data.invoked = false;
+
+        ASSERT_TRUE(aws_array_list_length(&callback_data.address_list) > 0);
+
+        aws_mutex_unlock(&mutex);
+    }
+
+    aws_host_resolver_listener_release(listener);
+
+    aws_host_resolver_release(resolver);
+
+    s_listener_test_callback_data_clean_up(&callback_data);
+    aws_mutex_clean_up(&mutex);
+    aws_string_destroy(host_name);
+
+    aws_event_loop_group_release(el_group);
+    ASSERT_SUCCESS(aws_global_thread_creator_shutdown_wait_for(10));
+
+    aws_io_library_clean_up();
+
+    return 0;
+}
+
+AWS_TEST_CASE(test_resolver_add_listener_before_host, s_test_resolver_add_listener_before_host_fn)
+
+static int s_test_resolver_add_listener_after_host_fn(struct aws_allocator *allocator, void *ctx) {
+    (void)ctx;
+
+    aws_io_library_init(allocator);
+
+    struct aws_string *host_name = aws_string_new_from_c_str(allocator, "s3.us-east-1.amazonaws.com");
+    struct aws_event_loop_group *el_group = aws_event_loop_group_new_default(allocator, 1, NULL);
+    struct aws_host_resolver *resolver = aws_host_resolver_new_default(allocator, 10, el_group, NULL);
+    struct aws_host_resolver_listener *listener = NULL;
+
+    struct aws_mutex mutex = AWS_MUTEX_INIT;
+    struct listener_test_callback_data callback_data;
+    s_listener_test_callback_data_init(allocator, &mutex, 1, &callback_data);
+
+    /* Trigger resolve host */
+    {
+        struct aws_host_resolution_config config = {
+            .max_ttl = 30,
+            .impl = aws_default_dns_resolve,
+            .impl_data = NULL,
+        };
+
+        ASSERT_SUCCESS(aws_host_resolver_resolve_host(
+            resolver, host_name, s_listener_test_initial_resolved_callback_empty, &config, NULL));
+    }
+
+    /* Setup listener after host is added */
+    {
+        struct aws_host_resolver_listener_options listener_options = {.host_name = host_name,
+                                                                      .resolved_address_callback =
+                                                                          s_listener_resolved_address_callback,
+                                                                      .user_data = &callback_data};
+
+        listener = aws_host_resolver_add_listener(resolver, &listener_options);
+    }
+
+    /* Wait for listeners to receive host resolved callback. */
+    {
+        ASSERT_SUCCESS(aws_mutex_lock(&mutex));
+
+        aws_condition_variable_wait_pred(
+            &callback_data.condition_variable, &mutex, s_listener_invoked_predicate, &callback_data);
+
+        /* Reset flag for re-use */
+        callback_data.invoked = false;
+
+        ASSERT_TRUE(aws_array_list_length(&callback_data.address_list) > 0);
+
+        aws_mutex_unlock(&mutex);
+    }
+
+    aws_host_resolver_listener_release(listener);
+
+    aws_host_resolver_release(resolver);
+
+    s_listener_test_callback_data_clean_up(&callback_data);
+    aws_mutex_clean_up(&mutex);
+    aws_string_destroy(host_name);
+
+    aws_event_loop_group_release(el_group);
+    ASSERT_SUCCESS(aws_global_thread_creator_shutdown_wait_for(10));
+
+    aws_io_library_clean_up();
+
+    return 0;
+}
+
+AWS_TEST_CASE(test_resolver_add_listener_after_host, s_test_resolver_add_listener_after_host_fn)
+
+static int s_test_resolver_listener_multiple_results_fn(struct aws_allocator *allocator, void *ctx) {
+    (void)ctx;
+
+    aws_io_library_init(allocator);
+
+    const uint32_t num_ipv4 = 4;
+    const uint32_t num_ipv6 = 4;
+
+    struct aws_string *host_name = aws_string_new_from_c_str(allocator, "test_host");
+    struct aws_event_loop_group *el_group = aws_event_loop_group_new_default(allocator, 1, NULL);
+    struct aws_host_resolver *resolver = aws_host_resolver_new_default(allocator, 10, el_group, NULL);
+    struct aws_host_resolver_listener *listener = NULL;
+
+    struct mock_dns_resolver mock_resolver;
+    ASSERT_SUCCESS(s_setup_mock_host(allocator, resolver, &mock_resolver, host_name, num_ipv4, num_ipv6));
+
+    struct aws_mutex mutex = AWS_MUTEX_INIT;
+    struct listener_test_callback_data callback_data;
+
+    s_listener_test_callback_data_init(allocator, &mutex, num_ipv4 + num_ipv6, &callback_data);
+
+    /* Setup listener before host is added */
+    {
+        struct aws_host_resolver_listener_options listener_options = {.host_name = host_name,
+                                                                      .resolved_address_callback =
+                                                                          s_listener_resolved_address_callback,
+                                                                      .user_data = &callback_data};
+
+        listener = aws_host_resolver_add_listener(resolver, &listener_options);
+    }
+
+    /* Trigger resolve host */
+    {
+        struct aws_host_resolution_config config = {
+            .max_ttl = 30,
+            .impl = mock_dns_resolve,
+            .impl_data = &mock_resolver,
+        };
+
+        ASSERT_SUCCESS(aws_host_resolver_resolve_host(
+            resolver, host_name, s_listener_test_initial_resolved_callback_empty, &config, NULL));
+    }
+
+    /* Wait for listener to receive host resolved callback. */
+    {
+        ASSERT_SUCCESS(aws_mutex_lock(&mutex));
+
+        aws_condition_variable_wait_pred(
+            &callback_data.condition_variable, &mutex, s_listener_invoked_predicate, &callback_data);
+
+        /* Reset flag for re-use */
+        callback_data.invoked = false;
+
+        ASSERT_SUCCESS(s_verify_mock_address_list(&callback_data.address_list, num_ipv4, num_ipv6));
+
+        aws_mutex_unlock(&mutex);
+    }
+
+    s_listener_test_callback_data_clean_up(&callback_data);
+    aws_host_resolver_listener_release(listener);
+
+    mock_dns_resolver_clean_up(&mock_resolver);
+    aws_host_resolver_release(resolver);
+
+    aws_mutex_clean_up(&mutex);
+    aws_string_destroy(host_name);
+
+    aws_event_loop_group_release(el_group);
+    ASSERT_SUCCESS(aws_global_thread_creator_shutdown_wait_for(10));
+
+    aws_io_library_clean_up();
+
+    return 0;
+}
+
+AWS_TEST_CASE(test_resolver_listener_multiple_results, s_test_resolver_listener_multiple_results_fn)
+
+static void s_cached_address_test_callback(struct aws_host_address *host_address, void *user_data) {
+
+    struct listener_test_callback_data *callback_data = user_data;
+
+    struct aws_host_address *host_address_copy =
+        aws_mem_acquire(callback_data->allocator, sizeof(struct aws_host_address));
+    aws_host_address_copy(host_address, host_address_copy);
+
+    aws_array_list_push_back(&callback_data->address_list, &host_address_copy);
+}
+
+static int s_test_resolver_get_cached_address(struct aws_allocator *allocator, void *ctx) {
+    (void)ctx;
+
+    const uint32_t num_ipv4 = 3;
+    const uint32_t num_ipv6 = 3;
+
+    aws_io_library_init(allocator);
+
+    struct aws_string *host_name = aws_string_new_from_c_str(allocator, "test_host");
+    struct aws_event_loop_group *el_group = aws_event_loop_group_new_default(allocator, 1, NULL);
+    struct aws_host_resolver *resolver = aws_host_resolver_new_default(allocator, 10, el_group, NULL);
+
+    struct mock_dns_resolver mock_resolver;
+    ASSERT_SUCCESS(s_setup_mock_host(allocator, resolver, &mock_resolver, host_name, num_ipv4, num_ipv6));
+
+    struct aws_mutex mutex = AWS_MUTEX_INIT;
+    struct listener_test_callback_data callback_data;
+    s_listener_test_callback_data_init(allocator, &mutex, num_ipv4 + num_ipv6, &callback_data);
+
+    struct aws_host_resolver_listener_options listener_options = {.host_name = host_name,
+                                                                  .resolved_address_callback =
+                                                                      s_listener_resolved_address_callback,
+                                                                  .user_data = &callback_data};
+
+    struct aws_host_resolver_listener *listener = aws_host_resolver_add_listener(resolver, &listener_options);
+
+    /* Trigger resolve host */
+    {
+        struct aws_host_resolution_config config = {
+            .max_ttl = 30,
+            .impl = mock_dns_resolve,
+            .impl_data = &mock_resolver,
+        };
+
+        ASSERT_SUCCESS(aws_host_resolver_resolve_host(
+            resolver, host_name, s_listener_test_initial_resolved_callback_empty, &config, &callback_data));
+    }
+
+    /* Listen for all of the addresses so that we know that they are in cache. */
+    {
+        ASSERT_SUCCESS(aws_mutex_lock(&mutex));
+
+        aws_condition_variable_wait_pred(
+            &callback_data.condition_variable, &mutex, s_listener_invoked_predicate, &callback_data);
+
+        ASSERT_SUCCESS(s_verify_mock_address_list(&callback_data.address_list, num_ipv4, num_ipv6));
+
+        aws_mutex_unlock(&mutex);
+
+        aws_host_resolver_listener_release(listener);
+        listener = NULL;
+
+        s_clear_host_address_array_list(callback_data.allocator, &callback_data.address_list);
+    }
+
+    /* Get one ipv4 and one ipv6 from cache */
+    {
+        struct aws_host_resolver_get_cached_addresses_options options = {.host_name = host_name,
+                                                                         .desired_num_a_addresses = 1,
+                                                                         .desired_num_aaaa_addresses = 1,
+                                                                         .get_cached_addresses_callback =
+                                                                             s_cached_address_test_callback,
+                                                                         .user_data = &callback_data};
+
+        aws_host_resolver_get_cached_addresses(resolver, &options);
+
+        s_verify_mock_address_list(&callback_data.address_list, 1, 1);
+
+        s_clear_host_address_array_list(callback_data.allocator, &callback_data.address_list);
+    }
+
+    /* Get all ipv4 and all ipv6 addresses from cache */
+    {
+        struct aws_host_resolver_get_cached_addresses_options options = {
+            .host_name = host_name,
+            .desired_num_a_addresses = g_aws_host_resolver_all_addresses,
+            .desired_num_aaaa_addresses = g_aws_host_resolver_all_addresses,
+            .get_cached_addresses_callback = s_cached_address_test_callback,
+            .user_data = &callback_data};
+
+        aws_host_resolver_get_cached_addresses(resolver, &options);
+
+        s_verify_mock_address_list(&callback_data.address_list, num_ipv4, num_ipv6);
+
+        s_clear_host_address_array_list(callback_data.allocator, &callback_data.address_list);
+    }
+
+    s_listener_test_callback_data_clean_up(&callback_data);
+    mock_dns_resolver_clean_up(&mock_resolver);
+    aws_host_resolver_release(resolver);
+    aws_mutex_clean_up(&mutex);
+    aws_string_destroy(host_name);
+    aws_event_loop_group_release(el_group);
+    ASSERT_SUCCESS(aws_global_thread_creator_shutdown_wait_for(10));
+
+    aws_io_library_clean_up();
+
+    return 0;
+}
+
+AWS_TEST_CASE(test_resolver_get_cached_address, s_test_resolver_get_cached_address)
