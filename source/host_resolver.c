@@ -17,8 +17,6 @@
 
 const uint64_t NS_PER_SEC = 1000000000;
 
-const size_t g_aws_host_resolver_all_addresses = (size_t)-1;
-
 int aws_host_address_copy(const struct aws_host_address *from, struct aws_host_address *to) {
     to->allocator = from->allocator;
     to->address = aws_string_new_from_string(to->allocator, from->address);
@@ -75,6 +73,19 @@ int aws_host_resolver_resolve_host(
     return resolver->vtable->resolve_host(resolver, host_name, res, config, user_data);
 }
 
+AWS_IO_API int aws_host_resolver_resolve_host_ex(
+    struct aws_host_resolver *resolver,
+    struct aws_resolve_host_options *options) {
+    AWS_ASSERT(resolver->vtable);
+
+    if (resolver->vtable->resolve_host_ex) {
+        return resolver->vtable->resolve_host_ex(resolver, options);
+    }
+
+    aws_raise_error(AWS_ERROR_UNSUPPORTED_OPERATION);
+    return AWS_OP_ERR;
+}
+
 int aws_host_resolver_purge_cache(struct aws_host_resolver *resolver) {
     AWS_ASSERT(resolver->vtable && resolver->vtable->purge_cache);
     return resolver->vtable->purge_cache(resolver);
@@ -83,20 +94,6 @@ int aws_host_resolver_purge_cache(struct aws_host_resolver *resolver) {
 int aws_host_resolver_record_connection_failure(struct aws_host_resolver *resolver, struct aws_host_address *address) {
     AWS_ASSERT(resolver->vtable && resolver->vtable->record_connection_failure);
     return resolver->vtable->record_connection_failure(resolver, address);
-}
-
-int aws_host_resolver_get_cached_addresses(
-    struct aws_host_resolver *resolver,
-    const struct aws_host_resolver_get_cached_addresses_options *options) {
-    AWS_ASSERT(resolver);
-    AWS_ASSERT(resolver->vtable);
-
-    if (resolver->vtable->get_cached_addresses) {
-        return resolver->vtable->get_cached_addresses(resolver, options);
-    }
-
-    aws_raise_error(AWS_ERROR_UNSUPPORTED_OPERATION);
-    return AWS_OP_ERR;
 }
 
 struct aws_host_resolver_listener *aws_host_resolver_add_listener(
@@ -1293,12 +1290,12 @@ setup_host_entry_error:
     return AWS_OP_ERR;
 }
 
-static int default_resolve_host(
-    struct aws_host_resolver *resolver,
-    const struct aws_string *host_name,
-    aws_on_host_resolved_result_fn *res,
-    struct aws_host_resolution_config *config,
-    void *user_data) {
+static int s_default_resolve_host(struct aws_host_resolver *resolver, const struct aws_resolve_host_options *options) {
+    const struct aws_string *host_name = options->host_name;
+    aws_on_host_resolved_result_fn *res = options->res;
+    struct aws_host_resolution_config *config = options->config;
+    void *user_data = options->user_data;
+
     int result = AWS_OP_SUCCESS;
 
     AWS_LOGF_DEBUG(AWS_LS_IO_DNS, "id=%p: Host resolution requested for %s", (void *)resolver, host_name->bytes);
@@ -1343,46 +1340,62 @@ static int default_resolve_host(
     host_entry->last_resolve_request_timestamp_ns = timestamp;
     host_entry->resolves_since_last_request = 0;
 
-    struct aws_host_address *aaaa_record = aws_lru_cache_use_lru_element(host_entry->aaaa_records);
-    struct aws_host_address *a_record = aws_lru_cache_use_lru_element(host_entry->a_records);
-    struct aws_host_address address_array[2];
-    AWS_ZERO_ARRAY(address_array);
-    struct aws_array_list callback_address_list;
-    aws_array_list_init_static(&callback_address_list, address_array, 2, sizeof(struct aws_host_address));
+    size_t num_a_records = aws_cache_get_element_count(host_entry->a_records);
+    size_t num_aaaa_records = aws_cache_get_element_count(host_entry->aaaa_records);
 
-    if ((aaaa_record || a_record)) {
+    if (num_a_records > options->max_a_cached_results) {
+        num_a_records = options->max_a_cached_results;
+    }
+
+    if (num_aaaa_records > options->max_aaaa_cached_results) {
+        num_aaaa_records = options->max_aaaa_cached_results;
+    }
+
+    size_t total_num_records = num_a_records + num_aaaa_records;
+
+    struct aws_array_list callback_address_list;
+
+    aws_array_list_init_dynamic(
+        &callback_address_list, resolver->allocator, total_num_records, sizeof(struct aws_host_address));
+
+    for (size_t i = 0; i < num_a_records; ++i) {
+        struct aws_host_address *a_record = aws_lru_cache_use_lru_element(host_entry->a_records);
+
+        struct aws_host_address a_record_cpy;
+        if (!aws_host_address_copy(a_record, &a_record_cpy)) {
+            aws_array_list_push_back(&callback_address_list, &a_record_cpy);
+            AWS_LOGF_TRACE(
+                AWS_LS_IO_DNS,
+                "id=%p: vending address %s for host %s to caller",
+                (void *)resolver,
+                a_record->address->bytes,
+                host_entry->host_name->bytes);
+        }
+    }
+
+    for (size_t i = 0; i < num_aaaa_records; ++i) {
+        struct aws_host_address *aaaa_record = aws_lru_cache_use_lru_element(host_entry->aaaa_records);
+
+        struct aws_host_address aaaa_record_cpy;
+        if (!aws_host_address_copy(aaaa_record, &aaaa_record_cpy)) {
+            aws_array_list_push_back(&callback_address_list, &aaaa_record_cpy);
+            AWS_LOGF_TRACE(
+                AWS_LS_IO_DNS,
+                "id=%p: vending address %s for host %s to caller",
+                (void *)resolver,
+                aaaa_record->address->bytes,
+                host_entry->host_name->bytes);
+        }
+    }
+
+    aws_mutex_unlock(&host_entry->entry_lock);
+
+    if ((num_a_records + num_aaaa_records) > 0) {
         AWS_LOGF_DEBUG(
             AWS_LS_IO_DNS,
             "id=%p: cached entries found for %s returning to caller.",
             (void *)resolver,
             host_name->bytes);
-
-        /* these will all need to be copied so that we don't hold the lock during the callback. */
-        if (aaaa_record) {
-            struct aws_host_address aaaa_record_cpy;
-            if (!aws_host_address_copy(aaaa_record, &aaaa_record_cpy)) {
-                aws_array_list_push_back(&callback_address_list, &aaaa_record_cpy);
-                AWS_LOGF_TRACE(
-                    AWS_LS_IO_DNS,
-                    "id=%p: vending address %s for host %s to caller",
-                    (void *)resolver,
-                    aaaa_record->address->bytes,
-                    host_entry->host_name->bytes);
-            }
-        }
-        if (a_record) {
-            struct aws_host_address a_record_cpy;
-            if (!aws_host_address_copy(a_record, &a_record_cpy)) {
-                aws_array_list_push_back(&callback_address_list, &a_record_cpy);
-                AWS_LOGF_TRACE(
-                    AWS_LS_IO_DNS,
-                    "id=%p: vending address %s for host %s to caller",
-                    (void *)resolver,
-                    a_record->address->bytes,
-                    host_entry->host_name->bytes);
-            }
-        }
-        aws_mutex_unlock(&host_entry->entry_lock);
 
         /* we don't want to do the callback WHILE we hold the lock someone may reentrantly call us. */
         if (aws_array_list_length(&callback_address_list)) {
@@ -1416,6 +1429,27 @@ static int default_resolve_host(
     aws_mutex_unlock(&host_entry->entry_lock);
 
     return result;
+}
+
+static int default_resolve_host(
+    struct aws_host_resolver *resolver,
+    const struct aws_string *host_name,
+    aws_on_host_resolved_result_fn *res,
+    struct aws_host_resolution_config *config,
+    void *user_data) {
+
+    struct aws_resolve_host_options options = {.host_name = host_name,
+                                               .res = res,
+                                               .config = config,
+                                               .user_data = user_data,
+                                               .max_a_cached_results = 1,
+                                               .max_aaaa_cached_results = 1};
+
+    return s_default_resolve_host(resolver, &options);
+}
+
+static int default_resolve_host_ex(struct aws_host_resolver *resolver, const struct aws_resolve_host_options *options) {
+    return s_default_resolve_host(resolver, options);
 }
 
 static size_t default_get_host_address_count(
@@ -1551,96 +1585,13 @@ listener_entry_alloc_failed:
     return NULL;
 }
 
-static void s_get_addresses_from_cache(
-    struct aws_cache *cache,
-    size_t desired_num_addresses,
-    const struct aws_host_resolver_get_cached_addresses_options *options) {
-
-    if (desired_num_addresses == 0) {
-        return;
-    }
-
-    size_t record_count = aws_cache_get_element_count(cache);
-    size_t num_records_to_receive = 0;
-
-    if (desired_num_addresses == g_aws_host_resolver_all_addresses) {
-        num_records_to_receive = record_count;
-    } else {
-        num_records_to_receive = desired_num_addresses;
-
-        if (num_records_to_receive > record_count) {
-            num_records_to_receive = record_count;
-        }
-    }
-
-    for (size_t i = 0; i < num_records_to_receive; ++i) {
-        struct aws_host_address *host_address = aws_lru_cache_use_lru_element(cache);
-        options->get_cached_addresses_callback(host_address, options->user_data);
-    }
-}
-
-static int default_get_cached_addresses(
-    struct aws_host_resolver *host_resolver,
-    const struct aws_host_resolver_get_cached_addresses_options *options) {
-
-    if (options == NULL) {
-        AWS_LOGF_ERROR(AWS_LS_IO_DNS, "Invalid options for default_get_cached_addresses; options cannot be null.");
-        aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
-        return AWS_OP_ERR;
-    }
-
-    if (options->host_name == NULL) {
-        AWS_LOGF_ERROR(AWS_LS_IO_DNS, "Invalid options for default_get_cached_addresses; host_name cannot be null.");
-        aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
-        return AWS_OP_ERR;
-    }
-
-    if (options->get_cached_addresses_callback == NULL) {
-        AWS_LOGF_ERROR(
-            AWS_LS_IO_DNS,
-            "Invalid options for default_get_cached_addresses; get_cached_addresses_callback cannot be null.");
-        aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
-        return AWS_OP_ERR;
-    }
-
-    struct default_host_resolver *default_host_resolver = host_resolver->impl;
-
-    aws_mutex_lock(&default_host_resolver->resolver_lock);
-
-    /* Try to find a host entry for this host, so that we can pass back cached addresses.  */
-    struct aws_hash_element *host_entry_element = NULL;
-    aws_hash_table_find(&default_host_resolver->host_entry_table, options->host_name, &host_entry_element);
-
-    struct host_entry *host_entry = NULL;
-    if (host_entry_element != NULL) {
-        host_entry = host_entry_element->value;
-        AWS_FATAL_ASSERT(host_entry != NULL);
-    }
-
-    /* If we don't have a host entry for this host right now, just unlock the resolver lock and return. */
-    if (host_entry == NULL) {
-        aws_mutex_unlock(&default_host_resolver->resolver_lock);
-        return AWS_OP_SUCCESS;
-    }
-
-    aws_mutex_lock(&host_entry->entry_lock);
-    aws_mutex_unlock(&default_host_resolver->resolver_lock);
-
-    s_get_addresses_from_cache(host_entry->a_records, options->desired_num_a_addresses, options);
-    s_get_addresses_from_cache(host_entry->aaaa_records, options->desired_num_aaaa_addresses, options);
-
-    aws_mutex_unlock(&host_entry->entry_lock);
-
-    return AWS_OP_SUCCESS;
-}
-
 static struct aws_host_resolver_vtable s_vtable = {
     .purge_cache = resolver_purge_cache,
     .resolve_host = default_resolve_host,
+    .resolve_host_ex = default_resolve_host_ex,
     .record_connection_failure = resolver_record_connection_failure,
     .get_host_address_count = default_get_host_address_count,
     .add_listener = default_add_listener,
-    .get_cached_addresses = default_get_cached_addresses,
     .destroy = resolver_destroy,
 };
 

@@ -1452,15 +1452,27 @@ static int s_test_resolver_listener_multiple_results_fn(struct aws_allocator *al
 
 AWS_TEST_CASE(test_resolver_listener_multiple_results, s_test_resolver_listener_multiple_results_fn)
 
-static void s_cached_address_test_callback(struct aws_host_address *host_address, void *user_data) {
+static void s_cached_address_test_callback(
+    struct aws_host_resolver *resolver,
+    const struct aws_string *host_name,
+    int err_code,
+    const struct aws_array_list *host_addresses,
+    void *user_data) {
 
     struct listener_test_callback_data *callback_data = user_data;
 
-    struct aws_host_address *host_address_copy =
-        aws_mem_acquire(callback_data->allocator, sizeof(struct aws_host_address));
-    aws_host_address_copy(host_address, host_address_copy);
+    for (size_t i = 0; i < aws_array_list_length(host_addresses); ++i) {
 
-    aws_array_list_push_back(&callback_data->address_list, &host_address_copy);
+        struct aws_host_address *host_address_copy =
+            aws_mem_acquire(callback_data->allocator, sizeof(struct aws_host_address));
+
+        struct aws_host_address *host_address = NULL;
+        aws_array_list_get_at_ptr(host_addresses, (void **)&host_address, i);
+
+        aws_host_address_copy(host_address, host_address_copy);
+
+        aws_array_list_push_back(&callback_data->address_list, &host_address_copy);
+    }
 }
 
 static int s_test_resolver_get_cached_address(struct aws_allocator *allocator, void *ctx) {
@@ -1489,14 +1501,14 @@ static int s_test_resolver_get_cached_address(struct aws_allocator *allocator, v
 
     struct aws_host_resolver_listener *listener = aws_host_resolver_add_listener(resolver, &listener_options);
 
+    struct aws_host_resolution_config config = {
+        .max_ttl = 30,
+        .impl = mock_dns_resolve,
+        .impl_data = &mock_resolver,
+    };
+
     /* Trigger resolve host */
     {
-        struct aws_host_resolution_config config = {
-            .max_ttl = 30,
-            .impl = mock_dns_resolve,
-            .impl_data = &mock_resolver,
-        };
-
         ASSERT_SUCCESS(aws_host_resolver_resolve_host(
             resolver, host_name, s_listener_test_initial_resolved_callback_empty, &config, &callback_data));
     }
@@ -1520,14 +1532,14 @@ static int s_test_resolver_get_cached_address(struct aws_allocator *allocator, v
 
     /* Get one ipv4 and one ipv6 from cache */
     {
-        struct aws_host_resolver_get_cached_addresses_options options = {.host_name = host_name,
-                                                                         .desired_num_a_addresses = 1,
-                                                                         .desired_num_aaaa_addresses = 1,
-                                                                         .get_cached_addresses_callback =
-                                                                             s_cached_address_test_callback,
-                                                                         .user_data = &callback_data};
+        struct aws_resolve_host_options options = {.host_name = host_name,
+                                                   .config = &config,
+                                                   .res = s_cached_address_test_callback,
+                                                   .user_data = &callback_data,
+                                                   .max_a_cached_results = 1,
+                                                   .max_aaaa_cached_results = 1};
 
-        aws_host_resolver_get_cached_addresses(resolver, &options);
+        aws_host_resolver_resolve_host_ex(resolver, &options);
 
         s_verify_mock_address_list(&callback_data.address_list, 1, 1);
 
@@ -1536,14 +1548,14 @@ static int s_test_resolver_get_cached_address(struct aws_allocator *allocator, v
 
     /* Get all ipv4 and all ipv6 addresses from cache */
     {
-        struct aws_host_resolver_get_cached_addresses_options options = {
-            .host_name = host_name,
-            .desired_num_a_addresses = g_aws_host_resolver_all_addresses,
-            .desired_num_aaaa_addresses = g_aws_host_resolver_all_addresses,
-            .get_cached_addresses_callback = s_cached_address_test_callback,
-            .user_data = &callback_data};
+        struct aws_resolve_host_options options = {.host_name = host_name,
+                                                   .config = &config,
+                                                   .res = s_cached_address_test_callback,
+                                                   .user_data = &callback_data,
+                                                   .max_a_cached_results = num_ipv4,
+                                                   .max_aaaa_cached_results = num_ipv6};
 
-        aws_host_resolver_get_cached_addresses(resolver, &options);
+        aws_host_resolver_resolve_host_ex(resolver, &options);
 
         s_verify_mock_address_list(&callback_data.address_list, num_ipv4, num_ipv6);
 
